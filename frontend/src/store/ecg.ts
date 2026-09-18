@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type { ECGLead, HRVData, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import {
+  detectRPeaks,
+  calculateHRV,
+  detectArrhythmias,
+  buildRhythmDiagnosis,
+} from '../utils/analysis';
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
@@ -57,6 +63,9 @@ export const useECGStore = defineStore('ecg', () => {
   const isLoading = ref<boolean>(false);
   const useBackend = ref<boolean>(false);
   const backendUrl = ref<string>('http://localhost:8000');
+  // 后端接口不可用时的错误信息；为空表示无错误。失败时保留上一次分析结果，
+  // 由界面提示用户重试，而不是静默回退到本地模拟（那会让两处口径看似不一致）。
+  const backendError = ref<string>('');
 
   let animationTimer: ReturnType<typeof setInterval> | null = null;
   let scrollOffset = ref<number>(0);
@@ -64,7 +73,8 @@ export const useECGStore = defineStore('ecg', () => {
   // Getters
   const currentSamples = computed(() => ecgData.value?.samples ?? []);
   const currentRPeaks = computed(() => ecgData.value?.rPeaks ?? []);
-  const currentHeartRate = computed(() => hrvData.value?.heartRate ?? heartRate.value);
+  // 只反映本次分析实测心率；算不出来就是 0，由界面按“数据不足”展示
+  const currentHeartRate = computed(() => hrvData.value?.heartRate ?? 0);
 
   // Actions
 
@@ -76,7 +86,6 @@ export const useECGStore = defineStore('ecg', () => {
     const samples: number[] = new Array(totalSamples);
     const config = LEAD_CONFIGS[selectedLead.value] || LEAD_CONFIGS['II'];
     const cycleDuration = 60.0 / heartRate.value;
-    const samplesPerCycle = Math.floor(cycleDuration * samplingRate.value);
 
     for (let i = 0; i < totalSamples; i++) {
       const time = i / samplingRate.value;
@@ -104,233 +113,110 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Pan-Tompkins R-peak detection algorithm
-   * Simplified implementation: bandpass -> differentiate -> square -> integrate -> threshold
-   */
-  function detectRPeaks(samples: number[], sr: number): RPeak[] {
-    const rPeaks: RPeak[] = [];
-    const minDistance = Math.floor(0.2 * sr); // 200ms minimum between peaks
-
-    // Simple moving average for baseline
-    const windowSize = Math.floor(0.15 * sr);
-    const threshold = samples.reduce((a, b) => a + b, 0) / samples.length;
-    const stdDev = Math.sqrt(
-      samples.reduce((sum, s) => sum + (s - threshold) ** 2, 0) / samples.length
-    );
-    const detectionThreshold = threshold + 0.5 * stdDev;
-
-    let lastPeakIndex = -minDistance;
-
-    for (let i = 1; i < samples.length - 1; i++) {
-      if (
-        samples[i] > detectionThreshold &&
-        samples[i] > samples[i - 1] &&
-        samples[i] > samples[i + 1] &&
-        i - lastPeakIndex >= minDistance
-      ) {
-        // Find local maximum in a small window
-        let maxVal = samples[i];
-        let maxIdx = i;
-        const searchRadius = Math.floor(0.01 * sr);
-        for (let j = Math.max(0, i - searchRadius); j < Math.min(samples.length, i + searchRadius); j++) {
-          if (samples[j] > maxVal) {
-            maxVal = samples[j];
-            maxIdx = j;
-          }
-        }
-
-        rPeaks.push({
-          index: maxIdx,
-          time: maxIdx / sr,
-          amplitude: maxVal,
-        });
-        lastPeakIndex = i;
-      }
-    }
-
-    return rPeaks;
-  }
-
-  /**
-   * Calculate HRV metrics from R-peak positions
-   * SDNN, RMSSD, pNN50
-   */
-  function calculateHRV(rPeaks: RPeak[], sr: number): HRVData {
-    if (rPeaks.length < 3) {
-      return { heartRate: heartRate.value, sdnn: 0, rmssd: 0, pnn50: 0, nnIntervals: [] };
-    }
-
-    const nnIntervals: number[] = [];
-    for (let i = 1; i < rPeaks.length; i++) {
-      const rr = ((rPeaks[i].index - rPeaks[i - 1].index) / sr) * 1000;
-      nnIntervals.push(rr);
-    }
-
-    const meanRR = nnIntervals.reduce((a, b) => a + b, 0) / nnIntervals.length;
-    const hr = meanRR > 0 ? 60000 / meanRR : 0;
-
-    // SDNN
-    const variance = nnIntervals.reduce((sum, x) => sum + (x - meanRR) ** 2, 0) / nnIntervals.length;
-    const sdnn = Math.sqrt(variance);
-
-    // RMSSD
-    let sumSquaredDiffs = 0;
-    for (let i = 1; i < nnIntervals.length; i++) {
-      sumSquaredDiffs += (nnIntervals[i] - nnIntervals[i - 1]) ** 2;
-    }
-    const rmssd = Math.sqrt(sumSquaredDiffs / (nnIntervals.length - 1));
-
-    // pNN50
-    let nn50Count = 0;
-    for (let i = 1; i < nnIntervals.length; i++) {
-      if (Math.abs(nnIntervals[i] - nnIntervals[i - 1]) > 50) {
-        nn50Count++;
-      }
-    }
-    const pnn50 = (nn50Count / (nnIntervals.length - 1)) * 100;
-
-    return {
-      heartRate: Math.round(hr * 10) / 10,
-      sdnn: Math.round(sdnn * 100) / 100,
-      rmssd: Math.round(rmssd * 100) / 100,
-      pnn50: Math.round(pnn50 * 100) / 100,
-      nnIntervals,
-    };
-  }
-
-  /**
-   * Arrhythmia detection: tachycardia, bradycardia, ST-elevation
-   */
-  function detectArrhythmias(hrv: HRVData, rPeaks: RPeak[], samples: number[], sr: number): ArrhythmiaEvent[] {
-    const events: ArrhythmiaEvent[] = [];
-    const hr = hrv.heartRate;
-
-    if (hr > 100) {
-      events.push({
-        eventType: 'tachycardia',
-        confidence: Math.min(1.0, (hr - 100) / 50 + 0.6),
-        description: `心率过快 (${hr.toFixed(0)} BPM)，检测到心动过速`,
-        timestamp: rPeaks[0]?.time ?? 0,
-      });
-    }
-
-    if (hr < 60 && hr > 0) {
-      events.push({
-        eventType: 'bradycardia',
-        confidence: Math.min(1.0, (60 - hr) / 30 + 0.6),
-        description: `心率过慢 (${hr.toFixed(0)} BPM)，检测到心动过缓`,
-        timestamp: rPeaks[0]?.time ?? 0,
-      });
-    }
-
-    // ST-segment elevation detection
-    let stElevationCount = 0;
-    for (const rp of rPeaks) {
-      const stStart = rp.index + Math.floor(0.08 * sr);
-      const stEnd = rp.index + Math.floor(0.12 * sr);
-      if (stEnd < samples.length) {
-        const stLevel = samples.slice(stStart, stEnd).reduce((a, b) => a + b, 0) / (stEnd - stStart);
-        const blStart = Math.max(0, rp.index - Math.floor(0.2 * sr));
-        const baseline = samples.slice(blStart, rp.index).reduce((a, b) => a + b, 0) / (rp.index - blStart);
-        if (stLevel - baseline > 0.1) {
-          stElevationCount++;
-        }
-      }
-    }
-    if (stElevationCount > rPeaks.length * 0.5) {
-      events.push({
-        eventType: 'st_elevation',
-        confidence: Math.min(1.0, stElevationCount / Math.max(1, rPeaks.length)),
-        description: '检测到 ST 段抬高，可能提示心肌梗死',
-        timestamp: rPeaks[0]?.time ?? 0,
-      });
-    }
-
-    if (events.length === 0) {
-      events.push({
-        eventType: 'normal',
-        confidence: 1.0,
-        description: '正常窦性心律',
-        timestamp: rPeaks[0]?.time ?? 0,
-      });
-    }
-
-    return events;
-  }
-
-  /**
    * Run full ECG analysis (frontend simulation)
    */
   async function analyzeECG() {
     isLoading.value = true;
+    backendError.value = '';
 
     if (useBackend.value) {
-      // Use backend API
       try {
-        const response = await fetch(`${backendUrl.value}/ecg/analyze`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            lead_name: selectedLead.value,
-            duration: duration.value,
-            sampling_rate: samplingRate.value,
-            heart_rate: heartRate.value,
-          }),
-        });
-        const data: ECGAnalysisResponse = await response.json();
-        ecgData.value = {
-          leadName: data.lead.lead_name,
-          samplingRate: data.lead.sampling_rate,
-          duration: data.lead.duration,
-          samples: data.lead.samples,
-          rPeaks: data.lead.r_peaks.map((rp: any) => ({
-            index: rp.index,
-            time: rp.time,
-            amplitude: rp.amplitude,
-          })),
-        };
-        hrvData.value = {
-          heartRate: data.hrv.heart_rate,
-          sdnn: data.hrv.sdnn,
-          rmssd: data.hrv.rmssd,
-          pnn50: data.hrv.pnn50,
-          nnIntervals: data.hrv.nn_intervals,
-        };
-        arrhythmiaEvents.value = data.arrhythmia_events.map((evt: any) => ({
-          eventType: evt.event_type,
-          confidence: evt.confidence,
-          description: evt.description,
-          timestamp: evt.timestamp,
-        }));
-        rhythmDiagnosis.value = data.rhythm_diagnosis;
+        await runBackendAnalysis();
       } catch (error) {
-        console.error('Backend API error:', error);
-        // Fallback to frontend simulation
-        runFrontendAnalysis();
+        // 接口暂时不可用：明确提示并保留重试入口，不静默用本地数据冒充
+        backendError.value =
+          error instanceof Error ? error.message : '后端分析服务暂时不可用，请稍后重试';
+        // 监测循环中失败则停止自动轮询，避免反复刷错误
+        stopMonitoring();
+      } finally {
+        isLoading.value = false;
       }
-    } else {
-      runFrontendAnalysis();
+      return;
     }
 
+    runFrontendAnalysis();
     isLoading.value = false;
+  }
+
+  async function runBackendAnalysis() {
+    let response: Response;
+    try {
+      response = await fetch(`${backendUrl.value}/ecg/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lead_name: selectedLead.value,
+          duration: duration.value,
+          sampling_rate: samplingRate.value,
+          heart_rate: heartRate.value,
+        }),
+      });
+    } catch {
+      throw new Error(
+        `无法连接分析服务 (${backendUrl.value})，请确认后端已启动后点击“重试”`,
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(`分析服务暂不可用 (HTTP ${response.status})，请稍后点击“重试”`);
+    }
+
+    const data: ECGAnalysisResponse = await response.json();
+    applyAnalysisResult(
+      {
+        leadName: data.lead.lead_name,
+        samplingRate: data.lead.sampling_rate,
+        duration: data.lead.duration,
+        samples: data.lead.samples,
+        rPeaks: data.lead.r_peaks.map((rp) => ({
+          index: rp.index,
+          time: rp.time,
+          amplitude: rp.amplitude,
+        })),
+      },
+      {
+        heartRate: data.hrv.heart_rate,
+        sdnn: data.hrv.sdnn,
+        rmssd: data.hrv.rmssd,
+        pnn50: data.hrv.pnn50,
+        nnIntervals: data.hrv.nn_intervals,
+      },
+      data.arrhythmia_events.map((evt) => ({
+        eventType: evt.event_type,
+        confidence: evt.confidence,
+        description: evt.description,
+        timestamp: evt.timestamp,
+      })),
+      data.rhythm_diagnosis,
+    );
   }
 
   function runFrontendAnalysis() {
     const lead = generateECGWaveform();
     const peaks = detectRPeaks(lead.samples, lead.samplingRate);
     lead.rPeaks = peaks;
-    ecgData.value = lead;
 
     const hrv = calculateHRV(peaks, lead.samplingRate);
-    hrvData.value = hrv;
-
     const events = detectArrhythmias(hrv, peaks, lead.samples, lead.samplingRate);
-    arrhythmiaEvents.value = events;
 
-    const isNormal = events.some(e => e.eventType === 'normal');
-    rhythmDiagnosis.value = isNormal
-      ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`
-      : events.map(e => e.description).join(' | ');
+    applyAnalysisResult(lead, hrv, events, buildRhythmDiagnosis(events, hrv));
+  }
+
+  /**
+   * 统一写入分析结果。诊断文案与事件列表同源：
+   * 后端结果直接采用后端文案，本地结果由与后端一致的 builder 生成，
+   * 保证分析页面状态栏与结果面板口径一致。
+   */
+  function applyAnalysisResult(
+    lead: ECGLead,
+    hrv: HRVData,
+    events: ArrhythmiaEvent[],
+    diagnosis: string,
+  ) {
+    ecgData.value = lead;
+    hrvData.value = hrv;
+    arrhythmiaEvents.value = events;
+    rhythmDiagnosis.value = diagnosis;
   }
 
   /**
@@ -394,6 +280,7 @@ export const useECGStore = defineStore('ecg', () => {
     isLoading,
     useBackend,
     backendUrl,
+    backendError,
     scrollOffset,
     // Getters
     currentSamples,
@@ -407,7 +294,5 @@ export const useECGStore = defineStore('ecg', () => {
     setHeartRate,
     generateECGWaveform,
     detectRPeaks,
-    calculateHRV,
-    detectArrhythmias,
   };
 });

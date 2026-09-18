@@ -20,18 +20,56 @@ export interface HRVData {
   nnIntervals: number[];
 }
 
+export type ArrhythmiaEventType =
+  | 'normal'
+  | 'tachycardia'
+  | 'bradycardia'
+  | 'st_elevation'
+  | 'atrial_fibrillation'
+  | 'premature_ventricular_contraction'
+  | 'insufficient_data';
+
 export interface ArrhythmiaEvent {
-  eventType: 'normal' | 'tachycardia' | 'bradycardia' | 'st_elevation' | 'atrial_fibrillation' | 'premature_ventricular_contraction';
+  eventType: ArrhythmiaEventType;
+  confidence: number;
+  description: string;
+  timestamp: number;
+}
+
+export interface RPeakDTO {
+  index: number;
+  time: number;
+  amplitude: number;
+}
+
+export interface ECGLeadDTO {
+  lead_name: string;
+  sampling_rate: number;
+  duration: number;
+  samples: number[];
+  r_peaks: RPeakDTO[];
+}
+
+export interface HRVDataDTO {
+  heart_rate: number;
+  sdnn: number;
+  rmssd: number;
+  pnn50: number;
+  nn_intervals: number[];
+}
+
+export interface ArrhythmiaEventDTO {
+  event_type: ArrhythmiaEventType;
   confidence: number;
   description: string;
   timestamp: number;
 }
 
 export interface ECGAnalysisResponse {
-  lead: ECGLead;
-  hrv: HRVData;
-  arrhythmiaEvents: ArrhythmiaEvent[];
-  rhythmDiagnosis: string;
+  lead: ECGLeadDTO;
+  hrv: HRVDataDTO;
+  arrhythmia_events: ArrhythmiaEventDTO[];
+  rhythm_diagnosis: string;
 }
 
 export interface ECGAnalysisRequest {

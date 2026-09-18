@@ -1,6 +1,7 @@
 import numpy as np
 from scipy import signal
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
+import re
 import math
 
 
@@ -259,15 +260,33 @@ def detect_arrhythmia(
 ) -> List[Dict[str, Any]]:
     """
     Detect arrhythmia events based on R-peaks, HRV metrics, and signal morphology.
-    
+
     Detects:
+    - Insufficient data: fewer than 3 detectable beats (HR not computable)
     - Tachycardia: HR > 100 BPM
     - Bradycardia: HR < 60 BPM
     - ST-segment elevation: potential myocardial infarction
     - Irregular rhythm patterns
+
+    心跳不足或心率算不出来时只输出 insufficient_data，
+    不允许判成 normal，也不允许判成任何心律失常。
     """
-    events = []
     heart_rate = hrv["heart_rate"]
+
+    # Insufficient data: not enough beats to estimate a rhythm
+    if len(r_peaks) < 3 or heart_rate <= 0:
+        return [
+            {
+                "event_type": "insufficient_data",
+                "confidence": 1.0,
+                "description": (
+                    f"有效心跳不足（检测到 {len(r_peaks)} 次，至少需要 3 次），数据不足以判读心律"
+                ),
+                "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
+            }
+        ]
+
+    events = []
 
     # Tachycardia detection
     if heart_rate > 100:
@@ -275,51 +294,34 @@ def detect_arrhythmia(
             "event_type": "tachycardia",
             "confidence": min(1.0, (heart_rate - 100) / 50 + 0.6),
             "description": f"心率过快 ({heart_rate:.0f} BPM)，检测到心动过速",
-            "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
+            "timestamp": r_peaks[0]["time"],
         })
 
-    # Bradycardia detection
-    if heart_rate < 60 and heart_rate > 0:
+    # Bradycardia detection (heart_rate <= 0 has already been handled above)
+    if heart_rate < 60:
         events.append({
             "event_type": "bradycardia",
             "confidence": min(1.0, (60 - heart_rate) / 30 + 0.6),
             "description": f"心率过慢 ({heart_rate:.0f} BPM)，检测到心动过缓",
-            "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
+            "timestamp": r_peaks[0]["time"],
         })
 
     # ST-segment elevation detection
-    if len(r_peaks) > 0:
-        st_elevation_count = 0
-        for rp in r_peaks:
-            idx = rp["index"]
-            # ST segment: ~80-120ms after R-peak
-            st_start = idx + int(0.08 * sampling_rate)
-            st_end = idx + int(0.12 * sampling_rate)
-            if st_end < len(ecg_signal):
-                st_level = np.mean(ecg_signal[st_start:st_end])
-                baseline = np.mean(ecg_signal[max(0, idx - int(0.2 * sampling_rate)):idx])
-                elevation = st_level - baseline
-                if elevation > 0.1:  # > 0.1 mV elevation
-                    st_elevation_count += 1
-
-        if st_elevation_count > len(r_peaks) * 0.5:
-            events.append({
-                "event_type": "st_elevation",
-                "confidence": min(1.0, st_elevation_count / max(1, len(r_peaks))),
-                "description": "检测到 ST 段抬高，可能提示心肌梗死",
-                "timestamp": r_peaks[0]["time"],
-            })
+    st_event = _detect_st_elevation(r_peaks, hrv, ecg_signal, sampling_rate)
+    if st_event is not None:
+        events.append(st_event)
 
     # Irregular rhythm detection (high SDNN relative to mean)
     if len(hrv.get("nn_intervals", [])) > 3:
         nn_array = np.array(hrv["nn_intervals"])
-        cv = np.std(nn_array) / np.mean(nn_array) if np.mean(nn_array) > 0 else 0
+        mean_nn = np.mean(nn_array)
+        cv = np.std(nn_array) / mean_nn if mean_nn > 0 else 0
         if cv > 0.15:
             events.append({
                 "event_type": "atrial_fibrillation",
                 "confidence": min(1.0, cv * 2),
                 "description": "RR 间期不规则，可能提示房颤",
-                "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
+                "timestamp": r_peaks[0]["time"],
             })
 
     # Normal rhythm
@@ -328,17 +330,106 @@ def detect_arrhythmia(
             "event_type": "normal",
             "confidence": 1.0,
             "description": "正常窦性心律",
-            "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
+            "timestamp": r_peaks[0]["time"],
         })
 
     return events
+
+
+# ST 抬高判定阈值 (mV)：ST 段相对等电位基线的抬升幅度
+ST_ELEVATION_THRESHOLD = 0.1
+# 至少需要多少个可测量的心拍才允许判读 ST 段
+ST_MIN_VALID_BEATS = 3
+
+
+def _beat_baseline(
+    ecg_signal: np.ndarray, idx: int, rr_samples: float
+) -> Optional[float]:
+    """
+    Estimate the isoelectric baseline for a beat from the TP segment.
+
+    Uses a window 0.30~0.24 RR before the R-peak (the flat interval after the
+    previous beat's T wave); window width is 0.06 RR so enough samples remain
+    even at high heart rates. Returns None when the signal is too short.
+    """
+    width = max(4, int(0.06 * rr_samples))
+    end = idx - int(0.24 * rr_samples)
+    start = max(0, end - width)
+    if end <= 0 or end - start < 3:
+        return None
+    return float(np.mean(ecg_signal[start:end]))
+
+
+def _measure_st_elevation(
+    ecg_signal: np.ndarray, idx: int, rr_samples: float
+) -> Optional[float]:
+    """
+    Measure one beat's ST-segment elevation (mV) above baseline.
+
+    The ST window spans 0.06~0.10 RR after the R-peak (around J+60ms, scaled
+    with beat length). A fixed millisecond window lands on the T wave at high
+    heart rates and produces false positives; T-wave upstroke only starts at
+    ~0.14 RR, so this window stays on the actual ST segment for any rhythm.
+    Returns None for beats that cannot be measured (truncated/insufficient).
+    """
+    st_start = idx + int(0.06 * rr_samples)
+    st_end = idx + int(0.10 * rr_samples)
+    if st_end >= len(ecg_signal):
+        return None
+    baseline = _beat_baseline(ecg_signal, idx, rr_samples)
+    if baseline is None:
+        return None
+    return float(np.mean(ecg_signal[st_start:st_end]) - baseline)
+
+
+def _detect_st_elevation(
+    r_peaks: List[Dict[str, Any]],
+    hrv: Dict[str, Any],
+    ecg_signal: np.ndarray,
+    sampling_rate: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Per-beat ST measurement with RR-adaptive windows. An ST elevation event is
+    reported only when more than half of the *measurable* beats (and at least
+    ST_MIN_VALID_BEATS) exceed the threshold. Unmeasurable beats are skipped
+    instead of being counted as elevated.
+    """
+    rr_samples_list = [rr / 1000.0 * sampling_rate for rr in hrv.get("nn_intervals", [])]
+    if not rr_samples_list:
+        return None
+
+    elevated = 0
+    measured = 0
+    for i, rp in enumerate(r_peaks):
+        # Last beat has no following RR; reuse the previous interval.
+        rr_samples = rr_samples_list[min(i, len(rr_samples_list) - 1)]
+        elevation = _measure_st_elevation(ecg_signal, rp["index"], rr_samples)
+        if elevation is None:
+            continue
+        measured += 1
+        if elevation > ST_ELEVATION_THRESHOLD:
+            elevated += 1
+
+    if measured >= ST_MIN_VALID_BEATS and elevated > measured * 0.5:
+        return {
+            "event_type": "st_elevation",
+            "confidence": min(1.0, elevated / measured),
+            "description": "检测到 ST 段抬高，可能提示心肌梗死",
+            "timestamp": r_peaks[0]["time"],
+        }
+    return None
 
 
 def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str, Any]) -> str:
     """Generate overall rhythm diagnosis based on detected events and HRV."""
     event_types = [e["event_type"] for e in arrhythmia_events]
 
-    if "st_elevation" in event_types:
+    if "insufficient_data" in event_types:
+        beat_count = _extract_beat_count(arrhythmia_events)
+        return (
+            f"数据不足，无法判读心律 | 有效心跳: {beat_count} 次 | 心率无法计算"
+        )
+    elif "st_elevation" in event_types:
         return "ST 段抬高 - 建议立即就医检查"
     elif "tachycardia" in event_types and "atrial_fibrillation" in event_types:
         return "快速房颤 - 建议进一步心脏评估"
@@ -352,3 +443,13 @@ def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str,
         hr = hrv.get("heart_rate", 0)
         sdnn = hrv.get("sdnn", 0)
         return f"正常窦性心律 | HR: {hr:.0f} BPM | SDNN: {sdnn:.1f} ms"
+
+
+def _extract_beat_count(events: List[Dict[str, Any]]) -> int:
+    for event in events:
+        if event.get("event_type") != "insufficient_data":
+            continue
+        match = re.search(r"检测到\s*(\d+)\s*次", event.get("description", ""))
+        if match:
+            return int(match.group(1))
+    return 0

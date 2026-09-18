@@ -7,33 +7,39 @@
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">心率 (HR)</div>
         <div class="text-2xl font-bold" :class="hrColor">
-          {{ hrvData?.heartRate?.toFixed(1) ?? '--' }}
-          <span class="text-sm font-normal text-gray-400">BPM</span>
+          <template v-if="hrAvailable">{{ hrvData?.heartRate?.toFixed(1) }}</template>
+          <template v-else>数据不足</template>
+          <span class="text-sm font-normal text-gray-400">
+            {{ hrAvailable ? 'BPM' : '' }}
+          </span>
         </div>
-        <div class="mt-1 h-1 rounded-full bg-gray-700 overflow-hidden">
-          <div
-            class="h-full rounded-full transition-all duration-500"
-            :class="hrBarColor"
-            :style="{ width: hrBarWidth + '%' }"
-          />
-        </div>
+        <template v-if="hrAvailable">
+          <div class="mt-1 h-1 rounded-full bg-gray-700 overflow-hidden">
+            <div
+              class="h-full rounded-full transition-all duration-500"
+              :class="hrBarColor"
+              :style="{ width: hrBarWidth + '%' }"
+            />
+          </div>
+        </template>
+        <div v-else class="mt-1 text-xs text-gray-500">有效心跳不足，心率无法计算</div>
       </div>
 
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">SDNN</div>
         <div class="text-2xl font-bold text-blue-400">
-          {{ hrvData?.sdnn?.toFixed(1) ?? '--' }}
+          {{ metricsAvailable ? hrvData?.sdnn?.toFixed(1) : '--' }}
           <span class="text-sm font-normal text-gray-400">ms</span>
         </div>
         <div class="mt-1 text-xs text-gray-500">
-          {{ sdnnLevel }}
+          {{ metricsAvailable ? sdnnLevel : '数据不足' }}
         </div>
       </div>
 
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">RMSSD</div>
         <div class="text-2xl font-bold text-purple-400">
-          {{ hrvData?.rmssd?.toFixed(1) ?? '--' }}
+          {{ metricsAvailable ? hrvData?.rmssd?.toFixed(1) : '--' }}
           <span class="text-sm font-normal text-gray-400">ms</span>
         </div>
         <div class="mt-1 text-xs text-gray-500">副交感神经活性指标</div>
@@ -42,7 +48,7 @@
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">pNN50</div>
         <div class="text-2xl font-bold text-amber-400">
-          {{ hrvData?.pnn50?.toFixed(1) ?? '--' }}
+          {{ metricsAvailable ? hrvData?.pnn50?.toFixed(1) : '--' }}
           <span class="text-sm font-normal text-gray-400">%</span>
         </div>
         <div class="mt-1 text-xs text-gray-500">相邻 RR 差值 > 50ms 占比</div>
@@ -52,7 +58,13 @@
     <!-- Tachogram Chart -->
     <div class="tachogram-section">
       <h4 class="text-sm font-medium text-gray-300 mb-2">RR 间期图 (Tachogram)</h4>
-      <v-chart class="tachogram-chart" :option="tachogramOption" autoresize />
+      <div
+        v-if="!metricsAvailable"
+        class="flex items-center justify-center h-[180px] text-xs text-gray-500 border border-gray-800 rounded bg-gray-900/40"
+      >
+        有效心跳不足，无法绘制 RR 间期
+      </div>
+      <v-chart v-else class="tachogram-chart" :option="tachogramOption" autoresize />
     </div>
   </div>
 </template>
@@ -72,30 +84,36 @@ const props = defineProps<{
   hrvData: HRVData | null;
 }>();
 
+// heartRate 为 0 表示心跳不足、心率算不出来（见 utils/analysis 约定）
+const hrAvailable = computed(() => !!props.hrvData && props.hrvData.heartRate > 0);
+const metricsAvailable = computed(
+  () => !!props.hrvData && props.hrvData.nnIntervals.length > 0,
+);
+
 const hrColor = computed(() => {
-  if (!props.hrvData) return 'text-gray-500';
-  const hr = props.hrvData.heartRate;
+  if (!hrAvailable.value) return 'text-gray-400';
+  const hr = props.hrvData!.heartRate;
   if (hr > 100) return 'text-red-400';
   if (hr < 60) return 'text-yellow-400';
   return 'text-emerald-400';
 });
 
 const hrBarColor = computed(() => {
-  if (!props.hrvData) return 'bg-gray-500';
-  const hr = props.hrvData.heartRate;
+  if (!hrAvailable.value) return 'bg-gray-500';
+  const hr = props.hrvData!.heartRate;
   if (hr > 100) return 'bg-red-500';
   if (hr < 60) return 'bg-yellow-500';
   return 'bg-emerald-500';
 });
 
 const hrBarWidth = computed(() => {
-  if (!props.hrvData) return 0;
-  return Math.min(100, (props.hrvData.heartRate / 180) * 100);
+  if (!hrAvailable.value) return 0;
+  return Math.min(100, (props.hrvData!.heartRate / 180) * 100);
 });
 
 const sdnnLevel = computed(() => {
-  if (!props.hrvData) return '';
-  const sdnn = props.hrvData.sdnn;
+  if (!metricsAvailable.value) return '数据不足';
+  const sdnn = props.hrvData!.sdnn;
   if (sdnn > 50) return 'HRV 正常';
   if (sdnn > 20) return 'HRV 偏低';
   return 'HRV 过低';

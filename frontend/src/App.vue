@@ -145,6 +145,28 @@
         <span class="ml-3 text-gray-400">正在分析心电信号...</span>
       </div>
 
+      <!-- Backend Error + Retry -->
+      <div
+        v-if="store.backendError && !store.isLoading"
+        class="flex items-center justify-between bg-red-950/40 rounded-lg border border-red-800/60 px-4 py-3"
+      >
+        <div class="flex items-center gap-3">
+          <svg class="w-5 h-5 text-red-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4a2 2 0 00-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" />
+          </svg>
+          <div>
+            <p class="text-sm text-red-300 font-medium">分析服务暂时不可用</p>
+            <p class="text-xs text-red-400/80 mt-0.5">{{ store.backendError }}</p>
+          </div>
+        </div>
+        <button
+          @click="store.analyzeECG()"
+          class="shrink-0 ml-4 px-4 py-1.5 rounded-lg text-sm font-medium bg-red-600 hover:bg-red-500 text-white transition-all"
+        >
+          重试
+        </button>
+      </div>
+
       <!-- ECG Waveform -->
       <ECGWaveform
         v-if="store.ecgData"
@@ -168,7 +190,7 @@
         <div class="arrhythmia-panel bg-gray-900/60 rounded-lg border border-gray-800 p-4">
           <h3 class="text-lg font-semibold text-red-400 mb-3">心律失常检测</h3>
           <div v-if="store.arrhythmiaEvents.length === 0" class="text-gray-500 text-sm py-4 text-center">
-            尚未检测到心律失常事件
+            暂无分析结果
           </div>
           <div v-else class="space-y-2">
             <div
@@ -184,17 +206,19 @@
                   ? 'bg-yellow-900/20 border-yellow-700/30 text-yellow-300'
                   : event.eventType === 'st_elevation'
                   ? 'bg-orange-900/20 border-orange-700/30 text-orange-300'
+                  : event.eventType === 'insufficient_data'
+                  ? 'bg-gray-800/40 border-gray-600/40 text-gray-300'
                   : 'bg-purple-900/20 border-purple-700/30 text-purple-300',
               ]"
             >
               <div class="flex items-center justify-between">
                 <span class="font-medium">{{ getEventLabel(event.eventType) }}</span>
-                <span class="text-xs opacity-70">
+                <span v-if="event.eventType !== 'insufficient_data'" class="text-xs opacity-70">
                   置信度: {{ (event.confidence * 100).toFixed(0) }}%
                 </span>
               </div>
               <p class="mt-1 text-xs opacity-80">{{ event.description }}</p>
-              <p class="mt-1 text-xs opacity-50">
+              <p v-if="event.eventType !== 'insufficient_data'" class="mt-1 text-xs opacity-50">
                 时间: {{ event.timestamp.toFixed(2) }}s
               </p>
             </div>
@@ -230,6 +254,7 @@ import { useECGStore } from './store/ecg';
 import ECGWaveform from './components/ECGWaveform.vue';
 import HRVAnalysis from './components/HRVAnalysis.vue';
 import { LEAD_NAMES } from './types';
+import { EVENT_LABELS } from './utils/analysis';
 
 const store = useECGStore();
 const leadNames = LEAD_NAMES;
@@ -241,15 +266,7 @@ const avgRR = computed(() => {
 });
 
 function getEventLabel(type: string): string {
-  const labels: Record<string, string> = {
-    normal: '正常窦性心律',
-    tachycardia: '心动过速',
-    bradycardia: '心动过缓',
-    st_elevation: 'ST 段抬高',
-    atrial_fibrillation: '房颤',
-    premature_ventricular_contraction: '室性早搏',
-  };
-  return labels[type] || type;
+  return EVENT_LABELS[type as keyof typeof EVENT_LABELS] ?? type;
 }
 
 onMounted(() => {
