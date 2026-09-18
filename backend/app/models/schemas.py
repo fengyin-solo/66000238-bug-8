@@ -20,6 +20,7 @@ class LeadName(str, Enum):
 
 class ArrhythmiaType(str, Enum):
     NORMAL = "normal"
+    INSUFFICIENT_DATA = "insufficient_data"
     TACHYCARDIA = "tachycardia"
     BRADYCARDIA = "bradycardia"
     ST_ELEVATION = "st_elevation"
@@ -34,11 +35,20 @@ class RPeak(BaseModel):
 
 
 class HRVMetrics(BaseModel):
-    heart_rate: float = Field(..., description="Heart rate in BPM")
-    sdnn: float = Field(..., description="Standard deviation of NN intervals (ms)")
-    rmssd: float = Field(..., description="Root mean square of successive differences (ms)")
-    pnn50: float = Field(..., description="Percentage of successive differences > 50ms")
+    heart_rate: Optional[float] = Field(
+        default=None,
+        description="Heart rate in BPM; null when too few beats were detected",
+    )
+    sdnn: Optional[float] = Field(default=None, description="Standard deviation of NN intervals (ms)")
+    rmssd: Optional[float] = Field(
+        default=None, description="Root mean square of successive differences (ms)"
+    )
+    pnn50: Optional[float] = Field(default=None, description="Percentage of successive differences > 50ms")
     nn_intervals: List[float] = Field(default_factory=list, description="NN intervals in ms")
+    beat_count: int = Field(default=0, description="Number of detected beats used for the metrics")
+    data_sufficient: bool = Field(
+        default=False, description="Whether enough beats were detected for a reliable analysis"
+    )
 
 
 class ArrhythmiaEvent(BaseModel):

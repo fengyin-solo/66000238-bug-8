@@ -2,13 +2,27 @@
   <div class="hrv-analysis-container">
     <h3 class="text-lg font-semibold text-cyan-400 mb-4">心率变异性分析 (HRV)</h3>
 
+    <!-- Insufficient data notice -->
+    <div
+      v-if="hrvData && !hrvData.dataSufficient"
+      class="mb-4 rounded-lg border border-amber-700/40 bg-amber-900/15 px-3 py-2 text-xs text-amber-300"
+    >
+      仅检测到 {{ hrvData.beatCount }} 次有效心跳（需 ≥ {{ MIN_BEATS }} 次），
+      心率与 HRV 指标无法计算，不据此判断正常或异常。请延长记录时间或检查信号质量。
+    </div>
+
     <!-- HRV Metrics Cards -->
     <div class="grid grid-cols-2 gap-3 mb-4">
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">心率 (HR)</div>
         <div class="text-2xl font-bold" :class="hrColor">
-          {{ hrvData?.heartRate?.toFixed(1) ?? '--' }}
-          <span class="text-sm font-normal text-gray-400">BPM</span>
+          <template v-if="hrvData && hrvData.heartRate !== null">
+            {{ hrvData.heartRate.toFixed(1) }}
+            <span class="text-sm font-normal text-gray-400">BPM</span>
+          </template>
+          <template v-else>
+            数据不足
+          </template>
         </div>
         <div class="mt-1 h-1 rounded-full bg-gray-700 overflow-hidden">
           <div
@@ -21,9 +35,12 @@
 
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">SDNN</div>
-        <div class="text-2xl font-bold text-blue-400">
-          {{ hrvData?.sdnn?.toFixed(1) ?? '--' }}
-          <span class="text-sm font-normal text-gray-400">ms</span>
+        <div class="text-2xl font-bold" :class="hrvData?.sdnn === null || hrvData?.sdnn === undefined ? 'text-amber-400' : 'text-blue-400'">
+          <template v-if="hrvData && hrvData.sdnn !== null">
+            {{ hrvData.sdnn.toFixed(1) }}
+            <span class="text-sm font-normal text-gray-400">ms</span>
+          </template>
+          <template v-else>数据不足</template>
         </div>
         <div class="mt-1 text-xs text-gray-500">
           {{ sdnnLevel }}
@@ -32,18 +49,24 @@
 
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">RMSSD</div>
-        <div class="text-2xl font-bold text-purple-400">
-          {{ hrvData?.rmssd?.toFixed(1) ?? '--' }}
-          <span class="text-sm font-normal text-gray-400">ms</span>
+        <div class="text-2xl font-bold" :class="hrvData?.rmssd === null || hrvData?.rmssd === undefined ? 'text-amber-400' : 'text-purple-400'">
+          <template v-if="hrvData && hrvData.rmssd !== null">
+            {{ hrvData.rmssd.toFixed(1) }}
+            <span class="text-sm font-normal text-gray-400">ms</span>
+          </template>
+          <template v-else>数据不足</template>
         </div>
         <div class="mt-1 text-xs text-gray-500">副交感神经活性指标</div>
       </div>
 
       <div class="metric-card bg-gray-800/60 rounded-lg p-3 border border-gray-700/50">
         <div class="text-xs text-gray-400 mb-1">pNN50</div>
-        <div class="text-2xl font-bold text-amber-400">
-          {{ hrvData?.pnn50?.toFixed(1) ?? '--' }}
-          <span class="text-sm font-normal text-gray-400">%</span>
+        <div class="text-2xl font-bold" :class="hrvData?.pnn50 === null || hrvData?.pnn50 === undefined ? 'text-amber-400' : 'text-amber-400'">
+          <template v-if="hrvData && hrvData.pnn50 !== null">
+            {{ hrvData.pnn50.toFixed(1) }}
+            <span class="text-sm font-normal text-gray-400">%</span>
+          </template>
+          <template v-else>数据不足</template>
         </div>
         <div class="mt-1 text-xs text-gray-500">相邻 RR 差值 > 50ms 占比</div>
       </div>
@@ -52,7 +75,14 @@
     <!-- Tachogram Chart -->
     <div class="tachogram-section">
       <h4 class="text-sm font-medium text-gray-300 mb-2">RR 间期图 (Tachogram)</h4>
-      <v-chart class="tachogram-chart" :option="tachogramOption" autoresize />
+      <div
+        v-if="!hrvData || hrvData.nnIntervals.length === 0"
+        class="flex items-center justify-center text-xs text-gray-500 border border-gray-800 rounded bg-gray-900/40"
+        style="height: 180px"
+      >
+        有效 RR 间期不足，暂无 Tachogram 数据
+      </div>
+      <v-chart v-else class="tachogram-chart" :option="tachogramOption" autoresize />
     </div>
   </div>
 </template>
@@ -65,6 +95,7 @@ import { CanvasRenderer } from 'echarts/renderers';
 import { LineChart } from 'echarts/charts';
 import { TooltipComponent, GridComponent, VisualMapComponent } from 'echarts/components';
 import type { HRVData } from '../types';
+import { MIN_BEATS_FOR_ANALYSIS as MIN_BEATS } from '../types';
 
 use([CanvasRenderer, LineChart, TooltipComponent, GridComponent, VisualMapComponent]);
 
@@ -72,8 +103,9 @@ const props = defineProps<{
   hrvData: HRVData | null;
 }>();
 
+// Unknown heart rate is amber ("数据不足"), never green-normal or red-0.
 const hrColor = computed(() => {
-  if (!props.hrvData) return 'text-gray-500';
+  if (!props.hrvData || props.hrvData.heartRate === null) return 'text-amber-400';
   const hr = props.hrvData.heartRate;
   if (hr > 100) return 'text-red-400';
   if (hr < 60) return 'text-yellow-400';
@@ -81,7 +113,7 @@ const hrColor = computed(() => {
 });
 
 const hrBarColor = computed(() => {
-  if (!props.hrvData) return 'bg-gray-500';
+  if (!props.hrvData || props.hrvData.heartRate === null) return 'bg-amber-500';
   const hr = props.hrvData.heartRate;
   if (hr > 100) return 'bg-red-500';
   if (hr < 60) return 'bg-yellow-500';
@@ -89,12 +121,12 @@ const hrBarColor = computed(() => {
 });
 
 const hrBarWidth = computed(() => {
-  if (!props.hrvData) return 0;
+  if (!props.hrvData || props.hrvData.heartRate === null) return 0;
   return Math.min(100, (props.hrvData.heartRate / 180) * 100);
 });
 
 const sdnnLevel = computed(() => {
-  if (!props.hrvData) return '';
+  if (!props.hrvData || props.hrvData.sdnn === null) return '数据不足，无法评估 HRV';
   const sdnn = props.hrvData.sdnn;
   if (sdnn > 50) return 'HRV 正常';
   if (sdnn > 20) return 'HRV 偏低';
@@ -152,7 +184,7 @@ const tachogramOption = computed(() => {
       {
         name: 'RR 间期',
         type: 'line',
-        data: data,
+        data,
         showSymbol: true,
         symbolSize: 4,
         lineStyle: { color: '#06b6d4', width: 1.5 },

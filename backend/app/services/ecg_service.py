@@ -140,18 +140,32 @@ def generate_ecg_signal(
     return t, ecg
 
 
+# Minimum number of beats required for a reliable rhythm/HRV analysis.
+# Fewer beats (short recording or very few detectable QRS complexes) must be
+# reported as "insufficient data" instead of normal or abnormal.
+MIN_BEATS_FOR_ANALYSIS = 4
+
+# ST-segment measurement windows relative to the R-peak:
+#   baseline: PR segment (isoelectric, avoids the P wave and QRS onset)
+#   ST level: post-J-point region before the T wave upstroke
+ST_ELEVATION_THRESHOLD_MV = 0.1
+ST_BASELINE_WINDOW_MS = (-65, -45)
+ST_LEVEL_WINDOW_MS = (50, 100)
+
+
 def pan_tompkins_r_peak_detection(
     ecg_signal: np.ndarray, sampling_rate: int = 500
 ) -> List[Dict[str, Any]]:
     """
     Simplified Pan-Tompkins algorithm for R-peak detection.
-    
+
     Steps:
     1. Bandpass filter (5-15 Hz)
     2. Differentiation
     3. Squaring
     4. Moving window integration
-    5. Adaptive thresholding for peak detection
+    5. Relative-threshold local-maxima search with a 200ms refractory gap
+    6. Polarity-aware refinement of the exact R location on the raw signal
     """
     # Step 1: Bandpass filter (5-15 Hz) to isolate QRS complex
     nyquist = sampling_rate / 2
@@ -160,39 +174,82 @@ def pan_tompkins_r_peak_detection(
     b, a = signal.butter(2, [low, high], btype="band")
     filtered = signal.filtfilt(b, a, ecg_signal)
 
-    # Step 2: Differentiation - highlights QRS slopes
+    # Steps 2-4: differentiate, square and integrate (150ms window)
     diff_signal = np.diff(filtered)
-
-    # Step 3: Squaring - emphasizes large differences
     squared = diff_signal ** 2
-
-    # Step 4: Moving window integration (150ms window)
     window_size = int(0.15 * sampling_rate)
     kernel = np.ones(window_size) / window_size
     integrated = np.convolve(squared, kernel, mode="same")
 
-    # Step 5: Adaptive threshold peak detection
-    threshold = np.mean(integrated) + 0.5 * np.std(integrated)
+    # Step 5: local maxima above a *relative* threshold.
+    # A fixed mean/std threshold produces zero detections on flat / very weak
+    # signals; scaling to the observed QRS energy keeps detection working
+    # across leads and amplitudes.
+    peak_energy = float(np.max(integrated)) if len(integrated) else 0.0
+    if peak_energy <= 0.0:
+        return []
+    threshold = 0.20 * peak_energy
     min_distance = int(0.2 * sampling_rate)  # Minimum 200ms between peaks
+    local_window = int(0.10 * sampling_rate)
 
-    r_peaks = []
-    above_threshold = integrated > threshold
-    last_peak = -min_distance
+    candidates: List[int] = []
+    for i in range(local_window, len(integrated) - local_window):
+        if (
+            integrated[i] > threshold
+            and integrated[i] == np.max(integrated[i - local_window:i + local_window + 1])
+        ):
+            # Refractory gap: keep only one candidate per 200ms neighborhood
+            if all(abs(i - c) >= min_distance for c in candidates):
+                candidates.append(i)
 
-    for i in range(1, len(integrated) - 1):
-        if above_threshold[i] and i - last_peak >= min_distance:
-            # Find the actual peak in the original signal within a window
-            search_start = max(0, i - window_size // 2)
-            search_end = min(len(ecg_signal), i + window_size // 2)
-            local_peak = search_start + np.argmax(ecg_signal[search_start:search_end])
+    if not candidates:
+        return []
 
-            if local_peak not in [rp["index"] for rp in r_peaks]:
-                r_peaks.append({
-                    "index": int(local_peak),
-                    "time": float(local_peak / sampling_rate),
-                    "amplitude": float(ecg_signal[local_peak]),
-                })
-                last_peak = i
+    # Step 6: polarity-aware R-peak refinement.
+    # The energy peak sits at the QRS *center*, which for asymmetric QRS can
+    # lie between the R and S waves, and the complex may be inverted (aVR) or
+    # dominated by a deep S (V1/V2). First determine the overall R polarity
+    # from the first beats, then take the signed extremum in +/-40ms.
+    # This replaces the old single-pass argmax in a wide window, which locked
+    # onto P/Q/T waves and displaced the ST measurement windows.
+    polarity_radius = int(0.05 * sampling_rate)
+    probe_values = []
+    for center in candidates[:6]:
+        seg_start = max(0, center - polarity_radius)
+        seg_end = min(len(ecg_signal), center + polarity_radius + 1)
+        seg = ecg_signal[seg_start:seg_end]
+        if len(seg) == 0:
+            continue
+        probe_values.append(
+            float(seg[np.argmax(seg)])
+            if abs(float(seg.max())) >= abs(float(seg.min()))
+            else float(seg[np.argmin(seg)])
+        )
+    if not probe_values:
+        return []
+    positive_polarity = float(np.median(probe_values)) >= 0
+
+    refine_radius = int(0.04 * sampling_rate)
+    min_qrs_amplitude = 0.05  # mV; rejects residual noise/artifact on flat traces
+    r_peaks: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for center in candidates:
+        search_start = max(0, center - refine_radius)
+        search_end = min(len(ecg_signal), center + refine_radius + 1)
+        window = ecg_signal[search_start:search_end]
+        if positive_polarity:
+            local_peak = search_start + int(np.argmax(window))
+        else:
+            local_peak = search_start + int(np.argmin(window))
+        if local_peak in seen or abs(float(ecg_signal[local_peak])) < min_qrs_amplitude:
+            continue
+        seen.add(local_peak)
+        r_peaks.append({
+            "index": int(local_peak),
+            "time": float(local_peak / sampling_rate),
+            "amplitude": float(ecg_signal[local_peak]),
+        })
 
     return r_peaks
 
@@ -200,20 +257,27 @@ def pan_tompkins_r_peak_detection(
 def calculate_hrv(r_peaks: List[Dict[str, Any]], sampling_rate: int = 500) -> Dict[str, Any]:
     """
     Calculate Heart Rate Variability (HRV) metrics from R-peak positions.
-    
+
     Metrics:
     - Heart Rate (BPM)
     - SDNN: Standard deviation of NN intervals
     - RMSSD: Root mean square of successive differences
     - pNN50: Percentage of successive differences > 50ms
+
+    When fewer than ``MIN_BEATS_FOR_ANALYSIS`` beats are detected, all metrics
+    are returned as ``None`` with ``data_sufficient=False``: a missing heart
+    rate must not be reported as 0 BPM or used for normal/abnormal decisions.
     """
-    if len(r_peaks) < 3:
+    beat_count = len(r_peaks)
+    if beat_count < MIN_BEATS_FOR_ANALYSIS:
         return {
-            "heart_rate": 0.0,
-            "sdnn": 0.0,
-            "rmssd": 0.0,
-            "pnn50": 0.0,
+            "heart_rate": None,
+            "sdnn": None,
+            "rmssd": None,
+            "pnn50": None,
             "nn_intervals": [],
+            "beat_count": beat_count,
+            "data_sufficient": False,
         }
 
     # Calculate RR intervals in milliseconds
@@ -226,7 +290,7 @@ def calculate_hrv(r_peaks: List[Dict[str, Any]], sampling_rate: int = 500) -> Di
 
     # Heart rate from mean RR interval
     mean_rr = np.mean(rr_array)
-    heart_rate = 60000.0 / mean_rr if mean_rr > 0 else 0.0
+    heart_rate = 60000.0 / mean_rr if mean_rr > 0 else None
 
     # SDNN: Standard deviation of all NN intervals
     sdnn = float(np.std(rr_array))
@@ -243,11 +307,13 @@ def calculate_hrv(r_peaks: List[Dict[str, Any]], sampling_rate: int = 500) -> Di
         pnn50 = 0.0
 
     return {
-        "heart_rate": round(heart_rate, 1),
+        "heart_rate": round(heart_rate, 1) if heart_rate is not None else None,
         "sdnn": round(sdnn, 2),
         "rmssd": round(rmssd, 2),
         "pnn50": round(pnn50, 2),
         "nn_intervals": [round(float(x), 2) for x in rr_intervals],
+        "beat_count": beat_count,
+        "data_sufficient": True,
     }
 
 
@@ -259,14 +325,31 @@ def detect_arrhythmia(
 ) -> List[Dict[str, Any]]:
     """
     Detect arrhythmia events based on R-peaks, HRV metrics, and signal morphology.
-    
+
     Detects:
     - Tachycardia: HR > 100 BPM
     - Bradycardia: HR < 60 BPM
     - ST-segment elevation: potential myocardial infarction
     - Irregular rhythm patterns
+
+    When not enough beats were detected, a single ``insufficient_data`` event
+    is returned: it is neither "normal" nor an arrhythmia, and every other
+    detector is skipped rather than guessing from one or two beats.
     """
     events = []
+
+    if not hrv.get("data_sufficient", False) or hrv.get("heart_rate") is None:
+        events.append({
+            "event_type": "insufficient_data",
+            "confidence": 1.0,
+            "description": (
+                f"有效心跳仅 {len(r_peaks)} 次，少于分析所需的 {MIN_BEATS_FOR_ANALYSIS} 次，"
+                "数据不足，无法判定心律是否正常"
+            ),
+            "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
+        })
+        return events
+
     heart_rate = hrv["heart_rate"]
 
     # Tachycardia detection
@@ -279,7 +362,7 @@ def detect_arrhythmia(
         })
 
     # Bradycardia detection
-    if heart_rate < 60 and heart_rate > 0:
+    if heart_rate < 60:
         events.append({
             "event_type": "bradycardia",
             "confidence": min(1.0, (60 - heart_rate) / 30 + 0.6),
@@ -287,33 +370,46 @@ def detect_arrhythmia(
             "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
         })
 
-    # ST-segment elevation detection
-    if len(r_peaks) > 0:
-        st_elevation_count = 0
-        for rp in r_peaks:
-            idx = rp["index"]
-            # ST segment: ~80-120ms after R-peak
-            st_start = idx + int(0.08 * sampling_rate)
-            st_end = idx + int(0.12 * sampling_rate)
-            if st_end < len(ecg_signal):
-                st_level = np.mean(ecg_signal[st_start:st_end])
-                baseline = np.mean(ecg_signal[max(0, idx - int(0.2 * sampling_rate)):idx])
-                elevation = st_level - baseline
-                if elevation > 0.1:  # > 0.1 mV elevation
-                    st_elevation_count += 1
+    # ST-segment elevation detection.
+    # Baseline is the isoelectric PR segment; the ST level is sampled in the
+    # post-J-point window. The previous implementation used a 200ms pre-R
+    # window (which contains the P and Q waves) and an ST window on the T-wave
+    # upstroke, so ordinary morphology was routinely reported as elevation.
+    elevated_count = 0
+    evaluated_count = 0
+    for rp in r_peaks:
+        idx = rp["index"]
+        bl_start = idx + int(ST_BASELINE_WINDOW_MS[0] / 1000 * sampling_rate)
+        bl_end = idx + int(ST_BASELINE_WINDOW_MS[1] / 1000 * sampling_rate)
+        st_start = idx + int(ST_LEVEL_WINDOW_MS[0] / 1000 * sampling_rate)
+        st_end = idx + int(ST_LEVEL_WINDOW_MS[1] / 1000 * sampling_rate)
+        if bl_start < 0 or st_end >= len(ecg_signal):
+            continue
 
-        if st_elevation_count > len(r_peaks) * 0.5:
-            events.append({
-                "event_type": "st_elevation",
-                "confidence": min(1.0, st_elevation_count / max(1, len(r_peaks))),
-                "description": "检测到 ST 段抬高，可能提示心肌梗死",
-                "timestamp": r_peaks[0]["time"],
-            })
+        st_level = float(np.mean(ecg_signal[st_start:st_end]))
+        baseline = float(np.mean(ecg_signal[bl_start:bl_end]))
+        evaluated_count += 1
+        if st_level - baseline > ST_ELEVATION_THRESHOLD_MV:
+            elevated_count += 1
+
+    # Only flag when most evaluable beats show elevation, and require enough
+    # beats for the majority vote to be meaningful.
+    if (
+        evaluated_count >= MIN_BEATS_FOR_ANALYSIS
+        and elevated_count > evaluated_count * 0.5
+    ):
+        events.append({
+            "event_type": "st_elevation",
+            "confidence": min(1.0, elevated_count / evaluated_count),
+            "description": "检测到 ST 段抬高，可能提示心肌梗死，建议立即就医检查",
+            "timestamp": r_peaks[0]["time"],
+        })
 
     # Irregular rhythm detection (high SDNN relative to mean)
     if len(hrv.get("nn_intervals", [])) > 3:
         nn_array = np.array(hrv["nn_intervals"])
-        cv = np.std(nn_array) / np.mean(nn_array) if np.mean(nn_array) > 0 else 0
+        mean_nn = np.mean(nn_array)
+        cv = np.std(nn_array) / mean_nn if mean_nn > 0 else 0
         if cv > 0.15:
             events.append({
                 "event_type": "atrial_fibrillation",
@@ -322,7 +418,7 @@ def detect_arrhythmia(
                 "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
             })
 
-    # Normal rhythm
+    # Normal rhythm: only reachable when data was sufficient AND no event fired
     if not events:
         events.append({
             "event_type": "normal",
@@ -335,11 +431,17 @@ def detect_arrhythmia(
 
 
 def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str, Any]) -> str:
-    """Generate overall rhythm diagnosis based on detected events and HRV."""
+    """Generate overall rhythm diagnosis based on detected events and HRV.
+
+    The wording here is the single source of truth shared with the frontend so
+    the analysis page and result panel never disagree.
+    """
     event_types = [e["event_type"] for e in arrhythmia_events]
 
+    if "insufficient_data" in event_types:
+        return "数据不足 - 有效心跳过少，无法判定心律，请延长记录时间或检查信号质量"
     if "st_elevation" in event_types:
-        return "ST 段抬高 - 建议立即就医检查"
+        return "ST 段抬高 - 检测到 ST 段抬高，建议立即就医检查"
     elif "tachycardia" in event_types and "atrial_fibrillation" in event_types:
         return "快速房颤 - 建议进一步心脏评估"
     elif "tachycardia" in event_types:
@@ -349,6 +451,8 @@ def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str,
     elif "atrial_fibrillation" in event_types:
         return "心律不规则 - 疑似房颤，建议 Holter 监测"
     else:
-        hr = hrv.get("heart_rate", 0)
-        sdnn = hrv.get("sdnn", 0)
+        hr = hrv.get("heart_rate")
+        sdnn = hrv.get("sdnn")
+        if hr is None or sdnn is None:
+            return "数据不足 - 有效心跳过少，无法判定心律，请延长记录时间或检查信号质量"
         return f"正常窦性心律 | HR: {hr:.0f} BPM | SDNN: {sdnn:.1f} ms"

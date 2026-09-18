@@ -145,6 +145,26 @@
         <span class="ml-3 text-gray-400">正在分析心电信号...</span>
       </div>
 
+      <!-- Backend error with retry -->
+      <div
+        v-if="store.apiError && !store.isLoading"
+        class="flex items-center justify-between bg-red-950/40 border border-red-800/60 rounded-lg px-4 py-3"
+      >
+        <div class="flex items-center gap-2 text-sm text-red-300">
+          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+          </svg>
+          <span>{{ store.apiError }}</span>
+        </div>
+        <button
+          @click="store.retryAnalysis()"
+          class="shrink-0 ml-4 px-3 py-1.5 rounded-lg text-xs font-medium bg-red-600 hover:bg-red-500 text-white transition-colors"
+        >
+          重试
+        </button>
+      </div>
+
       <!-- ECG Waveform -->
       <ECGWaveform
         v-if="store.ecgData"
@@ -178,6 +198,8 @@
                 'p-3 rounded-lg border text-sm',
                 event.eventType === 'normal'
                   ? 'bg-emerald-900/20 border-emerald-700/30 text-emerald-300'
+                  : event.eventType === 'insufficient_data'
+                  ? 'bg-amber-900/20 border-amber-700/40 text-amber-300'
                   : event.eventType === 'tachycardia'
                   ? 'bg-red-900/20 border-red-700/30 text-red-300'
                   : event.eventType === 'bradycardia'
@@ -189,12 +211,12 @@
             >
               <div class="flex items-center justify-between">
                 <span class="font-medium">{{ getEventLabel(event.eventType) }}</span>
-                <span class="text-xs opacity-70">
+                <span v-if="event.eventType !== 'insufficient_data'" class="text-xs opacity-70">
                   置信度: {{ (event.confidence * 100).toFixed(0) }}%
                 </span>
               </div>
               <p class="mt-1 text-xs opacity-80">{{ event.description }}</p>
-              <p class="mt-1 text-xs opacity-50">
+              <p v-if="event.eventType !== 'insufficient_data'" class="mt-1 text-xs opacity-50">
                 时间: {{ event.timestamp.toFixed(2) }}s
               </p>
             </div>
@@ -208,10 +230,14 @@
                 R 峰值数: <span class="text-gray-300">{{ store.ecgData?.rPeaks.length ?? 0 }}</span>
               </div>
               <div class="text-gray-500">
-                平均 RR: <span class="text-gray-300">{{ avgRR }} ms</span>
+                平均 RR:
+                <span class="text-gray-300">{{ store.dataSufficient ? `${avgRR} ms` : '数据不足' }}</span>
               </div>
               <div class="text-gray-500">
-                采样点数: <span class="text-gray-300">{{ store.ecgData?.samples.length ?? 0 }}</span>
+                有效心跳:
+                <span :class="store.dataSufficient ? 'text-gray-300' : 'text-amber-300'">
+                  {{ store.hrvData.beatCount }}
+                </span>
               </div>
               <div class="text-gray-500">
                 采样率: <span class="text-gray-300">{{ store.samplingRate }} Hz</span>
@@ -243,6 +269,7 @@ const avgRR = computed(() => {
 function getEventLabel(type: string): string {
   const labels: Record<string, string> = {
     normal: '正常窦性心律',
+    insufficient_data: '数据不足',
     tachycardia: '心动过速',
     bradycardia: '心动过缓',
     st_elevation: 'ST 段抬高',
